@@ -1,0 +1,263 @@
+// azipan~.c — core mono-safe binaural panner (MSP external)
+// Stereo in → Stereo out. Max 9 / 64-bit only.
+
+#include "ext.h"
+#include "ext_obex.h"
+#include "z_dsp.h"
+#include <math.h>
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
+// ---------- utilities ----------
+static inline double db_to_lin(double db){ return pow(10.0, db/20.0); }
+static inline double clamp(double x, double lo, double hi){ return x<lo?lo:(x>hi?hi:x); }
+static inline double signnz(double x){ return (x>0)-(x<0); }
+
+// ---------- simple one-pole smoother ----------
+typedef struct { double y; double a; } smooth1;
+static inline void smooth1_set(smooth1* s, double ms, double sr){
+    double T = 1.0/sr;
+    double tau = ms/1000.0;
+    s->a = (tau<=0.0) ? 0.0 : exp(-T/tau);
+}
+static inline double smooth1_step(smooth1* s, double target){
+    s->y = target + s->a*(s->y - target);
+    return s->y;
+}
+
+// ---------- state-variable filter (Chamberlin) ----------
+typedef struct { double ic1eq, ic2eq; double g, k; } svf;
+static inline void svf_setup(svf* f, double freq, double q, double sr){
+    double w = 2.0*M_PI * clamp(freq, 1.0, 0.45*sr) / sr;
+    f->g = tan(w/2.0);
+    f->k = 1.0 / clamp(q, 0.1, 10.0);
+}
+static inline void svf_init(svf* f){ f->ic1eq = f->ic2eq = 0.0; }
+static inline void svf_process(svf* f, double x, double* lp, double* bp, double* hp){
+    // SVF (Zavalishin style)
+    double g = f->g, k = f->k;
+    double v1 = (x - f->ic2eq - k*f->ic1eq) / (1.0 + k*g + g*g);
+    double v2 = f->ic1eq + g*v1;
+    double v3 = f->ic2eq + g*v2;
+    *lp = v3;
+    *bp = v2;
+    *hp = v1 - k*v2 - g*v3; // high derived
+    f->ic1eq = v2 + g*v1;
+    f->ic2eq = v3 + g*v2;
+}
+
+// ---------- 1st-order allpass (for quadrature chain) ----------
+typedef struct { double z; double a; } ap1;
+static inline void ap1_setup(ap1* a, double ms, double sr){
+    // first-order allpass via bilinear with given delay (approx), choose coefficient for mild 90° tilt
+    double d = ms/1000.0; if(d<0) d=0;
+    double wd = 2.0*M_PI * (1.0/(d>0?d:0.001)); // crude mapping
+    double T = 1.0/sr; double alpha = (wd*T - 2) / (wd*T + 2);
+    if (alpha<-0.99) alpha=-0.99; if(alpha>0.99) alpha=0.99;
+    a->a = alpha; a->z = 0.0;
+}
+static inline double ap1_tick(ap1* a, double x){
+    double y = -a->a*x + a->z;
+    a->z = x + a->a*y;
+    return y;
+}
+
+// ---------- LFO (cos/sin) ----------
+typedef struct { double ph, inc; } lfo;
+static inline void lfo_setup(lfo* l, double hz, double sr){ l->inc = (hz<=0?0:(hz/sr)); }
+static inline void lfo_setphase(lfo* l, double cyc){ l->ph = cyc - floor(cyc); }
+static inline double lfo_cos(lfo* l){ double y = cos(2.0*M_PI*l->ph); l->ph += l->inc; if(l->ph>=1) l->ph-=1; return y; }
+static inline double lfo_sin(lfo* l){ double y = sin(2.0*M_PI*l->ph); l->ph += l->inc; if(l->ph>=1) l->ph-=1; return y; }
+
+// ---------- object ----------
+typedef struct _azipan {
+    t_pxobject ob;
+
+    // params (targets)
+    double azimuth, width, gLS_dB, gHS_dB, gamma;
+    double mod_rate, mod_depth, mix_env;
+
+    // smoothed
+    smooth1 s_az, s_width, s_gLS, s_gHS, s_gamma, s_mrate, s_mdepth, s_mmix;
+
+    // filters
+    ap1 apA, apB;       // quadrature chain
+    svf svfLF, svfBP, svfHP, svfSideHP, svfOutHP; // LP700, BP~2.5k, HP3.5k, HP150, HP20
+
+    // LFO
+    lfo lfo_cos, lfo_sin;
+
+    // runtime
+    double sr;
+} t_azipan;
+
+// methods
+void *azipan_new(t_symbol *s, long argc, t_atom *argv);
+void azipan_free(t_azipan *x);
+void azipan_assist(t_azipan *x, void *b, long m, long a, char *s);
+void azipan_dsp64(t_azipan *x, t_object *dsp64, short *count, double samplerate, long maxvectorsize, long flags);
+void azipan_perform64(t_azipan *x, t_object *dsp64, double **ins, long numins, double **outs, long numouts, long sampleframes, long flags, void *userparam);
+
+// class
+static t_class *azipan_class;
+
+void ext_main(void* r){
+    t_class *c = class_new("azipan~", (method)azipan_new, (method)azipan_free, (long)sizeof(t_azipan), 0L, A_GIMME, 0);
+    class_dspinit(c);
+    class_addmethod(c, (method)azipan_dsp64, "dsp64", A_CANT, 0);
+    class_addmethod(c, (method)azipan_assist, "assist", A_CANT, 0);
+
+    CLASS_ATTR_FLOAT(c, "azimuth", 0, t_azipan, azimuth);
+    CLASS_ATTR_FLOAT(c, "width",   0, t_azipan, width);
+    CLASS_ATTR_FLOAT(c, "gLS",     0, t_azipan, gLS_dB);
+    CLASS_ATTR_FLOAT(c, "gHS",     0, t_azipan, gHS_dB);
+    CLASS_ATTR_FLOAT(c, "gamma",   0, t_azipan, gamma);
+    CLASS_ATTR_FLOAT(c, "rate",    0, t_azipan, mod_rate);
+    CLASS_ATTR_FLOAT(c, "depth",   0, t_azipan, mod_depth);
+    CLASS_ATTR_FLOAT(c, "mixenv",  0, t_azipan, mix_env);
+
+    class_register(CLASS_BOX, c);
+    azipan_class = c;
+}
+
+// ---- lifecycle ----
+void *azipan_new(t_symbol *s, long argc, t_atom *argv){
+    t_azipan *x = (t_azipan *)object_alloc(azipan_class);
+    dsp_setup((t_pxobject *)x, 2); // stereo in
+    outlet_new((t_object *)x, "signal");
+    outlet_new((t_object *)x, "signal");
+
+    x->azimuth = 0.0; x->width=0.85; x->gLS_dB=1.8; x->gHS_dB=4.0;
+    x->gamma=1.2; x->mod_rate=96.0; x->mod_depth=0.18; x->mix_env=0.25;
+    x->sr = sys_getsr();
+
+    // smoothing ~ 30 ms
+    smooth1_set(&x->s_az, 30, x->sr);
+    smooth1_set(&x->s_width, 30, x->sr);
+    smooth1_set(&x->s_gLS, 30, x->sr);
+    smooth1_set(&x->s_gHS, 30, x->sr);
+    smooth1_set(&x->s_gamma, 30, x->sr);
+    smooth1_set(&x->s_mrate, 100, x->sr);
+    smooth1_set(&x->s_mdepth, 30, x->sr);
+    smooth1_set(&x->s_mmix, 30, x->sr);
+
+    // filters init
+    ap1_setup(&x->apA, 0.9, x->sr);
+    ap1_setup(&x->apB, 0.3, x->sr);
+
+    svf_init(&x->svfLF);
+    svf_init(&x->svfBP);
+    svf_init(&x->svfHP);
+    svf_init(&x->svfSideHP);
+    svf_init(&x->svfOutHP);
+
+    return x;
+}
+
+void azipan_free(t_azipan *x){ dsp_free((t_pxobject *)x); }
+
+void azipan_assist(t_azipan *x, void *b, long m, long a, char *s){
+    if(m==ASSIST_INLET){
+        if(a==0) sprintf(s,"signal L"); else sprintf(s,"signal R");
+    }else{
+        if(a==0) sprintf(s,"signal L out"); else sprintf(s,"signal R out");
+    }
+}
+
+void azipan_dsp64(t_azipan *x, t_object *dsp64, short *count, double sr, long n, long flags){
+    x->sr = sr>0 ? sr : 48000.0;
+
+    // setup filters for this SR
+    svf_setup(&x->svfLF,   700.0, 0.6, x->sr);
+    svf_setup(&x->svfBP,  2500.0, 1.0, x->sr);
+    svf_setup(&x->svfHP,  3500.0, 0.5, x->sr);
+    svf_setup(&x->svfSideHP, 150.0, 0.7, x->sr);
+    svf_setup(&x->svfOutHP,   20.0, 0.7, x->sr);
+
+    lfo_setup(&x->lfo_cos, x->mod_rate, x->sr);
+    lfo_setup(&x->lfo_sin, x->mod_rate, x->sr);
+
+    object_method(dsp64, gensym("dsp_add64"), x, azipan_perform64, 0, NULL);
+}
+
+// ---- perform ----
+void azipan_perform64(t_azipan *x, t_object *dsp64, double **ins, long numins,
+                      double **outs, long numouts, long n, long flags, void *userparam)
+{
+    double *inL = ins[0], *inR = ins[1];
+    double *outL = outs[0], *outR = outs[1];
+
+    // prefetch smoothed params once per block
+    double az   = smooth1_step(&x->s_az,    x->azimuth);
+    double width= smooth1_step(&x->s_width, x->width);
+    double gLS  = smooth1_step(&x->s_gLS,   x->gLS_dB);
+    double gHS  = smooth1_step(&x->s_gHS,   x->gHS_dB);
+    double gamma= smooth1_step(&x->s_gamma, x->gamma);
+    double rate = smooth1_step(&x->s_mrate, x->mod_rate);
+    double depth= smooth1_step(&x->s_mdepth,x->mod_depth);
+    double mix  = smooth1_step(&x->s_mmix,  x->mix_env);
+
+    // update things that depend on params per block
+    double azN  = clamp(az/80.0, -1.0, 1.0);
+    double sgn  = signnz(azN);
+    double mag  = pow(fabs(azN), gamma);
+    double kgain= sgn * width * mag;
+    double dLS  = db_to_lin(gLS) - 1.0;
+    double dHS  = db_to_lin(gHS) - 1.0;
+
+    // update LFO rates
+    lfo_setup(&x->lfo_cos, rate, x->sr);
+    lfo_setup(&x->lfo_sin, rate, x->sr);
+    // map azimuth to phase rotation ±90° -> cycles offset
+    double phase_off = (azN * 0.5 + 0.5) ; // 0..1
+    lfo_setphase(&x->lfo_cos, phase_off);
+    lfo_setphase(&x->lfo_sin, phase_off + 0.25); // sin
+
+    for (long i = 0; i < n; ++i){
+        // M/S
+        double L = inL[i], R = inR[i];
+        double M = 0.5*(L + R);
+        double S = 0.5*(L - R);
+
+        // Quadrature (two 1st-order APs)
+        double Sq = ap1_tick(&x->apA, S);
+        Sq = ap1_tick(&x->apB, Sq);
+
+        // LF shuffling
+        double lp,bp,hp;
+        svf_process(&x->svfLF, Sq, &lp, &bp, &hp);
+        double S1 = Sq + dLS * lp;
+
+        // HF head-shadow
+        svf_process(&x->svfHP, S1, &lp, &bp, &hp); // reuse vars; hp = >3.5k
+        double S2 = S1 + dHS * hp * sgn;
+
+        // Azimuth law (amp)
+        double S3 = S2 * kgain;
+
+        // Envelope-ITD (BP 1–4k)
+        svf_process(&x->svfBP, S3, &lp, &bp, &hp); // bp ~2.5k, Q 1.0
+        double lfo = lfo_cos(&x->lfo_cos); // already rotated by phase_off
+        double am  = 1.0 + depth * lfo;
+        double S_env = bp * am;
+        double S4 = S3 + mix * (S_env - bp);
+
+        // Side HP 150 Hz (mono-compat safety)
+        svf_process(&x->svfSideHP, S4, &lp, &bp, &hp);
+        double Ssafe = hp;
+
+        // Rebuild
+        double Lo = M + Ssafe;
+        double Ro = M - Ssafe;
+
+        // Trim -1 dB
+        Lo *= 0.8912509381; // 10^(-1/20)
+        Ro *= 0.8912509381;
+
+        // HP 20 Hz out (very light)
+        svf_process(&x->svfOutHP, Lo, &lp,&bp,&hp); outL[i] = hp;
+        svf_process(&x->svfOutHP, Ro, &lp,&bp,&hp); outR[i] = hp;
+    }
+}
